@@ -1,0 +1,7 @@
+node_modules/
+*.log
+*.ics
+.env
+events-state.json
+google-calendar.ics
+.claude/*

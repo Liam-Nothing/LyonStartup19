@@ -1,0 +1,17 @@
+{
+  "name": "lyonstartup-scraper",
+  "version": "1.0.0",
+  "description": "Scraper Lyon Startup - Login, extract events, export ICS",
+  "main": "scraper.js",
+  "type": "module",
+  "scripts": {
+    "start": "node scraper.js",
+    "register": "node scraper.js --register",
+    "update": "node scraper.js --update",
+    "update-gcal": "node scraper.js --update-gcal"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "dotenv": "^17.3.1"
+  }
+}
