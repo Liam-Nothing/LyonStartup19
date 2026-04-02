@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { config } from 'dotenv';
+import nodemailer from 'nodemailer';
 
 config();
 
@@ -16,6 +17,9 @@ const EVENTS_PAGE = `${BASE_URL}/candidat/lsu/evenements`;
 const GCAL_PUBLIC_ICS = 'https://calendar.google.com/calendar/ical/c_fd90adfe043a9a8a835522b077cb6501356b444ea5b5ea89eeecfe036c0b2d8a%40group.calendar.google.com/public/basic.ics';
 const USERNAME = process.env.LSU_USERNAME;
 const PASSWORD = process.env.LSU_PASSWORD;
+const SMTP_USER = process.env.SMTP_USER;
+const SMTP_PASS = process.env.SMTP_PASS;
+const INVITE_TO = process.env.INVITE_TO || 'liam.faucitano@nopthingelse.fr';
 
 if (!USERNAME || !PASSWORD) {
   console.error('Missing LSU_USERNAME or LSU_PASSWORD in .env file');
@@ -31,6 +35,10 @@ const STATE_FILE = path.join(__dirname, 'events-state.json');
 const AUTO_REGISTER = process.argv.includes('--register');
 const UPDATE_MODE = process.argv.includes('--update');
 const UPDATE_GCAL = process.argv.includes('--update-gcal');
+const REGISTER_EVENT = (() => {
+  const idx = process.argv.indexOf('--register-event');
+  return idx !== -1 ? process.argv[idx + 1] : null;
+})();
 
 // Delay between requests (ms) to be polite
 const REQUEST_DELAY = 400;
@@ -566,6 +574,71 @@ function parseDates(event) {
 }
 
 // ---------------------------------------------------------------------------
+// Send calendar invite email
+// ---------------------------------------------------------------------------
+async function sendCalendarInvite(event) {
+  if (!SMTP_USER || !SMTP_PASS) {
+    warn(`  Skipping email invite (SMTP_USER/SMTP_PASS not configured)`);
+    return;
+  }
+
+  const { startDate, endDate, allDay } = parseDates(event);
+  if (!startDate) {
+    warn(`  Skipping email invite — no valid date for "${event.title}"`);
+    return;
+  }
+
+  const uid = makeUID(event);
+  const now = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+/, '');
+  const loc = (event.location + (event.address ? ' - ' + event.address : '')).replace(/,/g, '\\,').replace(/;/g, '\\;');
+  const desc = (event.description || '').replace(/\n/g, '\\n').replace(/,/g, '\\,').replace(/;/g, '\\;').substring(0, 500);
+  const titleClean = (event.title || '').replace(/,/g, '\\,').replace(/;/g, '\\;');
+
+  const icsContent = [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//Lyon Startup//LSU19 Scraper//FR',
+    'CALSCALE:GREGORIAN',
+    'METHOD:REQUEST',
+    'BEGIN:VEVENT',
+    allDay ? `DTSTART;VALUE=DATE:${startDate}` : `DTSTART;TZID=Europe/Paris:${startDate}`,
+    allDay ? `DTEND;VALUE=DATE:${endDate}` : `DTEND;TZID=Europe/Paris:${endDate}`,
+    `DTSTAMP:${now}`,
+    `UID:${uid}`,
+    `SUMMARY:${titleClean}`,
+    `DESCRIPTION:${desc}\\n\\nLien: ${event.url}`,
+    `LOCATION:${loc}`,
+    `URL:${event.url}`,
+    `ORGANIZER;CN=Lyon Startup:mailto:${SMTP_USER}`,
+    `ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:${INVITE_TO}`,
+    'STATUS:CONFIRMED',
+    `SEQUENCE:0`,
+    'END:VEVENT',
+    'END:VCALENDAR',
+  ].join('\r\n');
+
+  const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST || 'ssl0.ovh.net',
+    port: parseInt(process.env.SMTP_PORT || '465'),
+    secure: true,
+    auth: { user: SMTP_USER, pass: SMTP_PASS },
+  });
+
+  await transporter.sendMail({
+    from: `"Lyon Startup" <${SMTP_USER}>`,
+    to: INVITE_TO,
+    subject: `Invitation: ${event.title}`,
+    text: `${event.title}\n${event.dateRaw} ${event.horaires}\n${event.location} ${event.address}\n\n${event.description}\n\n${event.url}`,
+    icalEvent: {
+      method: 'REQUEST',
+      content: icsContent,
+    },
+  });
+
+  info(`  Email invite sent to ${INVITE_TO} for "${event.title}"`);
+}
+
+// ---------------------------------------------------------------------------
 // Step 6 — Generate ICS
 // ---------------------------------------------------------------------------
 function escapeICS(str) {
@@ -634,7 +707,7 @@ async function main() {
   info('========================================');
   info('  Lyon Startup Event Scraper');
   info('========================================');
-  const mode = UPDATE_GCAL ? 'UPDATE vs GOOGLE CALENDAR' : UPDATE_MODE ? 'UPDATE (diff local)' : AUTO_REGISTER ? 'SCRAPE + AUTO-REGISTER' : 'SCRAPE ONLY';
+  const mode = UPDATE_GCAL ? 'UPDATE vs GOOGLE CALENDAR' : UPDATE_MODE ? 'UPDATE (diff local)' : REGISTER_EVENT ? `REGISTER: "${REGISTER_EVENT}"` : AUTO_REGISTER ? 'SCRAPE + AUTO-REGISTER' : 'SCRAPE ONLY';
   info(`Mode: ${mode}`);
   info(`Start time: ${new Date().toISOString()}`);
   info(`Log file: ${LOG_FILE}`);
@@ -668,11 +741,13 @@ async function main() {
       await sleep(REQUEST_DELAY);
     }
 
-    // Step 4b — Auto-register if --register flag
+    // Step 4b — Auto-register if --register or --register-event flag
     const newlyRegistered = [];
     const registrationFailed = [];
-    if (AUTO_REGISTER) {
-      const toRegister = allEvents.filter(e => !e.isRegistered);
+    if (AUTO_REGISTER || REGISTER_EVENT) {
+      const toRegister = REGISTER_EVENT
+        ? allEvents.filter(e => !e.isRegistered && normalizeTitle(e.title).includes(normalizeTitle(REGISTER_EVENT)))
+        : allEvents.filter(e => !e.isRegistered);
       info('');
       info(`=== STEP 4b: Auto-registering to ${toRegister.length} events ===`);
       if (toRegister.length === 0) {
@@ -685,6 +760,7 @@ async function main() {
           if (success) {
             toRegister[i].isRegistered = true;
             newlyRegistered.push(toRegister[i]);
+            try { await sendCalendarInvite(toRegister[i]); } catch (e) { warn(`  Email invite failed: ${e.message}`); }
           } else {
             registrationFailed.push(toRegister[i]);
           }
